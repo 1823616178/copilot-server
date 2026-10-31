@@ -244,6 +244,35 @@ def _is_reply(message: dict) -> bool:
     )
 
 
+def _message_images(message: dict):
+    """Yield ``(url, prompt, is_data_uri)`` for images a bot message carries.
+
+    Image generation reports finished images (``status == 2``) as https
+    ``ImageReferenceUrls`` in ``contentGenerationProgressList``; an adaptive
+    card ``ImageSet`` repeats them as ``data:`` URIs.
+    """
+    if message.get("author") != "bot":
+        return
+    for prog in message.get("contentGenerationProgressList") or []:
+        if not isinstance(prog, dict) or prog.get("contentType") != "image":
+            continue
+        if prog.get("status") != 2:
+            continue
+        caption = " ".join(c for c in prog.get("captions") or [] if isinstance(c, str)).strip()
+        for url in prog.get("ImageReferenceUrls") or []:
+            if isinstance(url, str) and url.startswith("http"):
+                yield url, caption, False
+    for card in message.get("adaptiveCards") or []:
+        if not isinstance(card, dict):
+            continue
+        for block in card.get("body") or []:
+            if isinstance(block, dict) and block.get("type") == "ImageSet":
+                for img in block.get("images") or []:
+                    url = isinstance(img, dict) and img.get("url")
+                    if isinstance(url, str) and url.startswith("data:image/"):
+                        yield url, "", True
+
+
 class TurnParser:
     """Turn one chat turn's records into incremental reply text.
 
@@ -260,6 +289,10 @@ class TurnParser:
         self.done = False
         self.error: Optional[str] = None
         self.started_at = time.time()
+        # Generated images (copilot.models.ImageResponse), in arrival order.
+        self.images: list = []
+        self._image_urls: set = set()
+        self._data_images: list = []  # data: URI fallbacks, used only if no https URL
 
     def feed(self, record: dict) -> List[str]:
         kind = record.get("type")
@@ -275,12 +308,17 @@ class TurnParser:
             result = item.get("result") or {}
             if result.get("value") not in (None, "Success"):
                 self.error = result.get("message") or result.get("value")
-            replies = [m["text"] for m in item.get("messages") or [] if isinstance(m, dict) and _is_reply(m)]
-            return self._sync(replies[-1]) if replies else []
+            messages = [m for m in item.get("messages") or [] if isinstance(m, dict)]
+            replies = [m["text"] for m in messages if _is_reply(m)]
+            chunks = self._sync(replies[-1]) if replies else []
+            for m in messages:
+                chunks.extend(self._collect_images(m))
+            return chunks + self._flush_data_images()
         if kind == 3:  # invocation completion
             if record.get("error"):
                 self.error = record["error"]
             self.done = True
+            return self._flush_data_images()
         elif kind == 7:  # server closed the hub
             self.error = record.get("error") or "Copilot closed the chat socket"
             self.done = True
@@ -294,9 +332,41 @@ class TurnParser:
             self.text += delta
             chunks.append(delta)
         for message in arg.get("messages") or []:
-            if isinstance(message, dict) and _is_reply(message):
-                chunks.extend(self._sync(message["text"]))
+            if isinstance(message, dict):
+                if _is_reply(message):
+                    chunks.extend(self._sync(message["text"]))
+                chunks.extend(self._collect_images(message))
         return chunks
+
+    def _collect_images(self, message: dict) -> list:
+        """New https images as ImageResponse; stash data: URIs as fallback."""
+        from .models import ImageResponse
+
+        new = []
+        for url, caption, is_data in _message_images(message):
+            if url in self._image_urls:
+                continue
+            self._image_urls.add(url)
+            if is_data:
+                self._data_images.append(url)
+                continue
+            img = ImageResponse(url=url, prompt=caption, metadata={"source": "ImageReferenceUrls"})
+            self.images.append(img)
+            new.append(img)
+        return new
+
+    def _flush_data_images(self) -> list:
+        """At turn end, surface data: URIs only if no https image arrived."""
+        from .models import ImageResponse
+
+        if self.images or not self._data_images:
+            self._data_images = []
+            return []
+        new = [ImageResponse(url=u, prompt="", metadata={"source": "adaptiveCard"})
+               for u in self._data_images]
+        self._data_images = []
+        self.images.extend(new)
+        return new
 
     def _sync(self, full: str) -> List[str]:
         """Emit the part of a full-text snapshot not yet streamed."""

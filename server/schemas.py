@@ -24,3 +24,13 @@ class ChatCompletionRequest(BaseModel):
     conversation_id: Optional[str] = None
     # Any other OpenAI fields (temperature, max_tokens, ...) are accepted and
     # ignored — Copilot's consumer protocol doesn't expose those knobs.
+
+
+class ImageGenerationRequest(BaseModel):
+    """Subset of OpenAI's POST /v1/images/generations body."""
+
+    prompt: str
+    model: Optional[str] = None
+    n: Optional[int] = 1
+    size: Optional[str] = None
+    response_format: Optional[str] = "url"  # "url" | "b64_json"

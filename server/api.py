@@ -1,6 +1,8 @@
 """FastAPI app wiring Copilot onto the OpenAI Chat Completions API."""
 
+import base64
 import math
+import os
 import threading
 import time
 
@@ -19,7 +21,8 @@ from .openai_format import (
 )
 from .prompt import messages_to_prompt
 from .ratelimit import TokenBucket
-from .schemas import ChatCompletionRequest
+from .schemas import ChatCompletionRequest, ImageGenerationRequest
+from copilot.models import ImageResponse
 
 import logging
 
@@ -86,6 +89,10 @@ def _stream(prompt: str, model: str, conversation_id=None):
             for piece in stream:
                 if isinstance(piece, str) and piece:
                     yield sse_event(stream_chunk(cid, created, model, {"content": piece}))
+                elif isinstance(piece, ImageResponse):
+                    md = _image_markdown(piece)
+                    if md:
+                        yield sse_event(stream_chunk(cid, created, model, {"content": md}))
             # Copilot's conversation id is known once the stream has run; emit it
             # on the final chunk so callers can track the upstream thread.
             yield sse_event(
@@ -161,7 +168,60 @@ def chat_completions(req: ChatCompletionRequest):
             status_code=502,
             content={"error": {"message": str(exc), "type": "upstream_error"}},
         )
-    return completion_response(reply.text, model, reply.conversation_id)
+    text = reply.text + "".join(_image_markdown(i) for i in reply.images)
+    return completion_response(text.lstrip("\n") if not reply.text else text,
+                               model, reply.conversation_id)
+
+
+# data: URIs are megabytes; only inline them when explicitly allowed.
+_ALLOW_DATA_URI = os.environ.get("COPILOT_IMAGE_DATA_URI", "").lower() in ("1", "true", "yes")
+
+
+def _image_markdown(img: ImageResponse) -> str:
+    url = img.url or ""
+    if url.startswith("data:") and not _ALLOW_DATA_URI:
+        return "\n\n[image generated, but only available as an inline data URI; set COPILOT_IMAGE_DATA_URI=1 to include it]\n"
+    return f"\n\n![image]({url})\n" if url else ""
+
+
+def _fetch_b64(url: str) -> str:
+    if url.startswith("data:"):
+        return url.split(",", 1)[1]
+    from curl_cffi.requests import Session
+
+    with Session(impersonate="chrome", proxy=PROXY, timeout=60) as s:
+        r = s.get(url)
+        r.raise_for_status()
+        return base64.b64encode(r.content).decode()
+
+
+@app.post("/v1/images/generations")
+def images_generations(req: ImageGenerationRequest):
+    """OpenAI Images API shim: asks Copilot to draw ``prompt``."""
+    limited = _rate_limited_response()
+    if limited is not None:
+        return limited
+    try:
+        with _upstream_lock:
+            reply = client.chat(f"请生成一张图片：{req.prompt}")
+    except (NotSignedIn, AuthExpired) as exc:
+        return JSONResponse(status_code=401, content={"error": {"message": str(exc), "type": "authentication_error"}})
+    except Exception as exc:
+        logger.warning("image generation failed: %s: %s", type(exc).__name__, exc)
+        return JSONResponse(status_code=502, content={"error": {"message": str(exc), "type": "upstream_error"}})
+    if not reply.images:
+        return JSONResponse(status_code=502, content={"error": {
+            "message": f"Copilot returned no image: {reply.text[:300]}", "type": "upstream_error"}})
+    data = []
+    for img in reply.images[: max(1, req.n or 1)]:
+        if req.response_format == "b64_json":
+            try:
+                data.append({"b64_json": _fetch_b64(img.url), "revised_prompt": img.prompt or None})
+            except Exception as exc:
+                return JSONResponse(status_code=502, content={"error": {"message": f"image download failed: {exc}", "type": "upstream_error"}})
+        else:
+            data.append({"url": img.url, "revised_prompt": img.prompt or None})
+    return {"created": int(time.time()), "data": data}
 
 
 @app.get("/healthz")
