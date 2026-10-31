@@ -201,6 +201,8 @@ def _load_auth(path, profile_dir, max_age, proxy, auto_login, force) -> dict:
         )
 
     print("No saved Copilot session found — opening a browser to sign in...")
+    from copilot.browser import BrowserCopilot
+
     auth = BrowserCopilot(profile_dir=profile_dir, headless=False, proxy=proxy).login(path=path)
     if not auth.get("access_token"):
         raise RuntimeError(

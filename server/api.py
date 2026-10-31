@@ -1,5 +1,6 @@
 """FastAPI app wiring Copilot onto the OpenAI Chat Completions API."""
 
+import math
 import threading
 import time
 
@@ -48,7 +49,7 @@ def _rate_limited_response():
     allowed, wait = _rate_limiter.try_acquire()
     if allowed:
         return None
-    secs = max(1, round(wait))
+    secs = max(1, math.ceil(wait))
     return JSONResponse(
         status_code=429,
         headers={"Retry-After": str(secs)},

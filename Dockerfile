@@ -1,15 +1,26 @@
 # Playwright needs Chromium + system libs. The official Playwright Python image
-# ships them preinstalled and matches our playwright>=1.60 pin.
+# ships them preinstalled. Keep its version in sync with requirements.txt.
 FROM mcr.microsoft.com/playwright/python:v1.60.0-noble
 
 WORKDIR /app
 
+# Override for networks where PyPI is unreachable.
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_DEFAULT_TIMEOUT=60
+ARG PIP_RETRIES=3
+
 # Install Python deps first so the layer caches across code changes.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && python -m playwright install chromium
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --disable-pip-version-check \
+        --index-url "${PIP_INDEX_URL}" \
+        --timeout "${PIP_DEFAULT_TIMEOUT}" --retries "${PIP_RETRIES}" \
+        -r requirements.txt \
+    && python -m pip check
 
-COPY . .
+COPY app.py .
+COPY copilot/ copilot/
+COPY server/ server/
 
 # Serve on all interfaces inside the container; map the port in compose.
 ENV HOST=0.0.0.0 \

@@ -11,6 +11,9 @@ docs/
 
 # Local config / secrets
 config.json
+.env
+.env.*
+!.env.example
 
 # Dev files
 test.py

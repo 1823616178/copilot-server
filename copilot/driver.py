@@ -131,33 +131,34 @@ class Copilot(AbstractProvider):
         stalled socket raises instead of blocking for the full ``timeout``.
         """
         parser = TurnParser()
-        buffer = ""
-        last_record = None
-        overall_deadline = time.time() + timeout
+        buffer = b""
+        overall_deadline = time.monotonic() + timeout
         while not parser.done:
-            idle_deadline = time.time() + idle_timeout
+            if time.monotonic() >= overall_deadline:
+                raise TimeoutError(f"Copilot stream exceeded {timeout}s")
+            idle_deadline = time.monotonic() + idle_timeout
             try:
                 chunk = self._recv_frame(wss, min(overall_deadline, idle_deadline))
-            except Exception:
-                break  # socket closed/errored -> end of stream
+            except (CurlError, ConnectionError, OSError) as exc:
+                raise ConnectionError("Copilot stream interrupted before completion") from exc
             if chunk is None:  # deadline passed with no frame
-                if time.time() >= overall_deadline:
+                if time.monotonic() >= overall_deadline:
                     raise TimeoutError(f"Copilot stream exceeded {timeout}s")
                 raise TimeoutError(
-                    f"Copilot chat socket went silent for {idle_timeout}s; "
-                    f"last record was {last_record!r}."
+                    f"Copilot chat socket went silent for {idle_timeout}s"
                 )
-            buffer += chunk.decode("utf-8", "replace")
-            *complete, buffer = buffer.split("\x1e")
-            for record in split_records("\x1e".join(complete)):
-                last_record = record
+            if not chunk:
+                raise ConnectionError("Copilot stream closed before completion")
+            # Decode only complete records: UTF-8 characters can span frames.
+            buffer += chunk
+            *complete, buffer = buffer.split(b"\x1e")
+            for record in split_records(b"\x1e".join(complete)):
                 for text in parser.feed(record):
                     yield text
                 if parser.error:
                     self._raise_error(parser.error)
-
-        if not parser.done and not parser.text:
-            raise RuntimeError(f"Invalid response: {last_record}")
+                if parser.done:
+                    break
 
     @staticmethod
     def _raise_error(error) -> None:
@@ -174,7 +175,7 @@ class Copilot(AbstractProvider):
         """Block for one complete WS frame, or return ``None`` past ``deadline``.
 
         Reassembles libcurl's fragments like ``curl_cffi``'s own ``recv()`` but
-        breaks out of the ``CURLE_AGAIN`` wait once ``deadline`` (epoch seconds)
+        breaks out of the ``CURLE_AGAIN`` wait once ``deadline`` (monotonic seconds)
         is reached, so an idle socket can't hang us indefinitely. Non-AGAIN curl
         errors (e.g. a closed connection) propagate to the caller.
         """
@@ -183,6 +184,8 @@ class Copilot(AbstractProvider):
             raise ConnectionError("WebSocket has no active socket")
         chunks = []
         while True:
+            if time.monotonic() >= deadline:
+                return None
             try:
                 chunk, frame = wss.recv_fragment()
                 chunks.append(chunk)
@@ -191,7 +194,7 @@ class Copilot(AbstractProvider):
             except CurlError as e:
                 if e.code != CurlECode.AGAIN:
                     raise
-                remaining = deadline - time.time()
+                remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
                 select([sock_fd], [], [], min(0.5, remaining))

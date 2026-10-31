@@ -1,6 +1,13 @@
 services:
   copilot-api:
-    build: .
+    build:
+      context: .
+      network: "${COPILOT_BUILD_NETWORK:-default}"
+      args:
+        # Override with COPILOT_PIP_INDEX_URL for a mirror or internal index.
+        PIP_INDEX_URL: "${COPILOT_PIP_INDEX_URL:-https://pypi.org/simple}"
+        PIP_DEFAULT_TIMEOUT: "${COPILOT_PIP_TIMEOUT:-60}"
+        PIP_RETRIES: "${COPILOT_PIP_RETRIES:-3}"
     image: windows-copilot-api
     ports:
       - "8000:8000"

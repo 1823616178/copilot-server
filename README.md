@@ -117,6 +117,52 @@ docker build -t windows-copilot-api .
 docker run --rm -p 8000:8000 -v "$(pwd)/session:/app/session" windows-copilot-api
 ```
 
+**Slow builds / PyPI connection timeouts.** The package index is configurable.
+The default is official PyPI; if it is unreachable, try the HTTPS
+[TUNA PyPI mirror](https://mirrors.tuna.tsinghua.edu.cn/help/pypi/) or your internal
+index (these examples use Bash):
+
+```bash
+# Build with the configured index, then start the service.
+docker compose --progress=plain build
+docker compose up -d
+
+# Use a mirror, or substitute your internal index URL.
+COPILOT_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple docker compose build
+
+# Direct docker builds default to PyPI; select the mirror explicitly.
+docker build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+  -t windows-copilot-api .
+```
+
+Compose also accepts `COPILOT_PIP_TIMEOUT` (default: 60 seconds per socket
+operation) and `COPILOT_PIP_RETRIES` (default: 3); these settings can be saved in
+a local `.env` file. Increasing the timeout alone will not fix an unreachable
+index. If both indexes time out, check the Docker builder's DNS, outbound network,
+or proxy configuration. For a build proxy, pass `--build-arg HTTPS_PROXY=http://host:port`
+to the build command; the proxy must be reachable from the builder.
+If a mirror returns HTTP 403 for package downloads, use another reachable index
+or official PyPI; an accessible index page alone does not guarantee wheel downloads.
+
+On Linux, if the host can reach the index but Docker's bridge network times out,
+use the host network for the build only:
+
+```bash
+COPILOT_BUILD_NETWORK=host docker compose --progress=plain build
+# Equivalent for a direct build: docker build --network=host --build-arg ... .
+```
+
+You can persist `COPILOT_BUILD_NETWORK=host` in `.env`. The default is `default`;
+this setting affects dependency installation during builds, not the running
+service's network. Docker Desktop requires host networking support to be enabled.
+
+Builds require BuildKit (enabled by default in modern Docker/Compose). The pip
+download cache persists in the builder, outside the final image, so dependency
+changes can reuse downloads. The Python Playwright version is pinned to match
+the base image's preinstalled browsers; update both versions together. Docker
+builds no longer run `playwright install chromium`. Only application code is
+copied into the image, and local `.env` files are excluded from the build context.
+
 **Headless server notes (fork).** The container sets `COPILOT_HEADLESS=1`, so it never tries to open a sign-in window; without a valid session requests return HTTP 401 with instructions. Sign in on a desktop, then copy only `session/token.json` to the server's `./session/` (the Chromium profile is not portable between Windows and Linux). The access token is renewed over plain HTTP with the refresh token and the rotated refresh token is written back to `token.json`, so keep the volume writable. If refresh fails (refresh token expired/revoked), sign in again on the desktop and re-copy `token.json`. Override paths with `COPILOT_AUTH_FILE` / `COPILOT_PROFILE_DIR`, the license with `COPILOT_LICENSE=Free|Premium`. `GET /healthz` reports liveness.
 
 **Timezone fix.** copilot.com rejects non-IANA timezone names (e.g. `中国标准时间` on Chinese Windows) with `InvalidRequest`; the client now sends an IANA zone (tzlocal / `TZ` / `Etc/GMT±N`).
