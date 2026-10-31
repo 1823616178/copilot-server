@@ -159,10 +159,49 @@ def _location_info() -> dict:
     }
 
 
-def chat_frame(text: str, request_id: str, session_id: str, start_of_session: bool) -> dict:
+# --- image upload (reference images for image-to-image / editing) ----------
+# Captured from copilot.com (session/upload_capture.json): the web client POSTs
+# each picture as a multipart form to UploadFile *before* the chat turn, with
+# the chat bearer token, and gets back a ``docId``. The chat invocation then
+# references it in ``message.messageAnnotations`` (one ImageFile per picture).
+UPLOAD_URL = "https://substrate.office.com/m365Copilot/UploadFile"
+UPLOAD_VARIANTS = "feature.EnableImageSupportInUploadFile"
+UPLOAD_OPTIONS_SETS = ["cwcgptvsan", "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch", "gptvnorm2048"]
+# Extra chat optionsSet the web client adds so several pictures fit in one turn.
+MULTI_IMAGE_OPTION = "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch"
+UPLOAD_MIME_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
+                   "image/webp": "webp", "image/gif": "gif", "image/bmp": "bmp"}
+
+
+def upload_form(data_url: str, conversation_id: str):
+    """Multipart body + content type for one UploadFile request."""
+    import uuid as _uuid
+    boundary = "----WebKitFormBoundary" + _uuid.uuid4().hex[:16]
+    fields = [("scenario", "UploadImage"), ("conversationId", conversation_id),
+              ("FileBase64", data_url)] + [("optionsSets", o) for o in UPLOAD_OPTIONS_SETS]
+    body = "".join(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+        for k, v in fields) + f"--{boundary}--\r\n"
+    return body.encode(), f"multipart/form-data; boundary={boundary}"
+
+
+def image_annotation(doc_id: str, file_name: str, file_type: str) -> dict:
+    """``messageAnnotations`` entry pointing the chat turn at an uploaded image."""
+    return {
+        "id": doc_id,
+        "messageAnnotationMetadata": {
+            "@type": "File", "annotationType": "File",
+            "fileType": file_type, "fileName": file_name,
+        },
+        "messageAnnotationType": "ImageFile",
+    }
+
+
+def chat_frame(text: str, request_id: str, session_id: str, start_of_session: bool,
+               annotations: Optional[list] = None) -> dict:
     """The ``chat`` invocation the web client sends for one user message."""
     client_info = _client_info(session_id)
-    return {
+    frame = {
         "arguments": [{
             "source": "officeweb",
             "clientCorrelationId": request_id,
@@ -203,6 +242,11 @@ def chat_frame(text: str, request_id: str, session_id: str, start_of_session: bo
         "target": "chat",
         "type": 4,
     }
+    if annotations:
+        arg = frame["arguments"][0]
+        arg["message"]["messageAnnotations"] = list(annotations)
+        arg["optionsSets"] = OPTIONS_SETS + [MULTI_IMAGE_OPTION]
+    return frame
 
 
 def encode(record: dict) -> bytes:

@@ -138,6 +138,7 @@ class CopilotClient:
                 proxy=self._proxy,
                 access_token=auth["access_token"],
                 oid=auth["oid"],
+                anchor=auth.get("anchor"),
                 **kwargs,
             )
             if conversation_id is None:

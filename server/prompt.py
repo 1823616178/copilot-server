@@ -25,6 +25,23 @@ def content_text(content: Optional[Union[str, List[Any]]]) -> str:
     return "\n".join(p for p in parts if p)
 
 
+def image_urls(messages: List[ChatMessage]) -> List[str]:
+    """``image_url`` parts of the last user message (data: or http(s) URLs)."""
+    for m in reversed(messages):
+        if m.role != "user":
+            continue
+        urls = []
+        if isinstance(m.content, list):
+            for part in m.content:
+                if isinstance(part, dict) and part.get("type") in ("image_url", "input_image"):
+                    v = part.get("image_url")
+                    url = v.get("url") if isinstance(v, dict) else v
+                    if isinstance(url, str) and url:
+                        urls.append(url)
+        return urls
+    return []
+
+
 def messages_to_prompt(messages: List[ChatMessage]) -> str:
     """Flatten an OpenAI ``messages`` array into a single Copilot prompt."""
     system = "\n\n".join(

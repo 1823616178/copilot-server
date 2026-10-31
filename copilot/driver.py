@@ -22,7 +22,36 @@ from .models import AbstractProvider, Conversation, ImageType
 from .protocol import (
     CHATHUB_URL, HANDSHAKE, HUB_PARAMS, MSA_TENANT, PING, VARIANTS,
     TurnParser, chat_frame, encode, split_records,
+    UPLOAD_MIME_EXT, UPLOAD_URL, UPLOAD_VARIANTS, image_annotation, upload_form,
 )
+
+
+def _as_image(item):
+    """Normalise ``bytes`` / ``(bytes, mime)`` / ``data:`` URL into ``(bytes, mime)``."""
+    import base64
+    if isinstance(item, dict):
+        item = (item["data"], item.get("mime_type") or item.get("mimeType"))
+    if isinstance(item, str):
+        if not item.startswith("data:"):
+            raise ValueError("image strings must be data: URLs")
+        head, b64 = item.split(",", 1)
+        return base64.b64decode(b64), head[5:].split(";", 1)[0]
+    if isinstance(item, (bytes, bytearray)):
+        return bytes(item), _sniff_mime(item)
+    data, mime = item
+    return bytes(data), (mime or _sniff_mime(data)).lower()
+
+
+def _sniff_mime(data: bytes) -> str:
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:4] == b"GIF8":
+        return "image/gif"
+    return "image/png"
 
 # curl_cffi's WebSocket.recv() loops on CURLE_AGAIN forever (select() then retry)
 # and never returns on an idle socket, so we drive the fragment loop ourselves to
@@ -80,8 +109,10 @@ class Copilot(AbstractProvider):
           * neither — start a fresh one (the client picks its id). With
             ``return_conversation`` the new :class:`Conversation` is yielded first.
         """
+        images = list(kwargs.pop("images", None) or [])
         if image is not None:
-            raise NotImplementedError("Image input isn't supported on copilot.com yet.")
+            images.insert(0, image)
+        anchor = kwargs.pop("anchor", None)
         if conversation is not None:
             conversation_id = conversation.conversation_id
             access_token = access_token or conversation.access_token
@@ -94,6 +125,12 @@ class Copilot(AbstractProvider):
             conversation_id = str(uuid.uuid4())
             if return_conversation:
                 yield Conversation(conversation_id, CookieJar(), access_token)
+
+        annotations = []
+        for i, img in enumerate(images):
+            annotations.append(self.upload_image(
+                img, access_token=access_token, oid=oid, tenant=tenant, anchor=anchor,
+                conversation_id=conversation_id, proxy=proxy, name=f"image{i + 1}"))
 
         request_id = str(uuid.uuid4())
         session_id = str(uuid.uuid4())
@@ -120,9 +157,48 @@ class Copilot(AbstractProvider):
                 raise
             wss.send(HANDSHAKE, CurlWsFlag.TEXT)
             wss.send(PING, CurlWsFlag.TEXT)
-            wss.send(encode(chat_frame(prompt, request_id, session_id, start_of_session)),
+            wss.send(encode(chat_frame(prompt, request_id, session_id, start_of_session,
+                                        annotations or None)),
                      CurlWsFlag.TEXT)
             yield from self._read_stream(wss, timeout)
+
+    @staticmethod
+    def upload_image(image, access_token: str, oid: str, tenant: str = MSA_TENANT,
+                     anchor: Optional[str] = None, conversation_id: Optional[str] = None,
+                     proxy: Optional[str] = None, name: str = "image", timeout: int = 120) -> dict:
+        """Upload one reference image; return its ``messageAnnotations`` entry.
+
+        ``image`` is ``bytes``, ``(bytes, mime)`` or a ``data:`` URL.
+        """
+        import base64
+        data, mime = _as_image(image)
+        ext = UPLOAD_MIME_EXT.get(mime)
+        if not ext:
+            raise ValueError(f"unsupported image type {mime!r} (use png/jpeg/webp/gif)")
+        data_url = f"data:{mime};base64," + base64.b64encode(data).decode()
+        body, ctype = upload_form(data_url, conversation_id or str(uuid.uuid4()))
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": ctype,
+            "Origin": "https://copilot.com",
+            "Referer": "https://copilot.com/",
+            "X-AnchorMailbox": anchor or f"Oid:{oid}@{tenant}",
+            "X-Scenario": HUB_PARAMS["scenario"],
+            "X-Variants": UPLOAD_VARIANTS,
+        }
+        with Session(timeout=timeout, proxy=proxy, impersonate="chrome") as s:
+            r = s.post(UPLOAD_URL, data=body, headers=headers)
+        if r.status_code in (401, 403):
+            raise AuthExpired(f"Copilot rejected the access token on upload (HTTP {r.status_code})")
+        try:
+            js = r.json()
+        except Exception:
+            js = {}
+        doc_id = js.get("docId")
+        if r.status_code != 200 or not doc_id or (js.get("result") or {}).get("value") not in (None, "Success"):
+            msg = (js.get("result") or {}).get("message") or r.text[:300]
+            raise RuntimeError(f"Copilot image upload failed (HTTP {r.status_code}): {msg}")
+        return image_annotation(doc_id, f"{name}.{ext}", ext)
 
     def _read_stream(self, wss, timeout: int, idle_timeout: int = 90):
         """Consume hub records until the turn completes, yielding reply text.

@@ -14,6 +14,11 @@ MODEL_NAME = "copilot"
 RATE_LIMIT_RPM = float(os.environ.get("RATE_LIMIT_RPM", "12"))  # 12 rpm ≈ 5s per call
 RATE_LIMIT_BURST = int(os.environ.get("RATE_LIMIT_BURST", "4"))
 
+# Reference images per request. The web client lets several pictures into one
+# turn (optionsSet flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch).
+MAX_INPUT_IMAGES = int(os.environ.get("COPILOT_MAX_INPUT_IMAGES", "4"))
+MAX_INPUT_IMAGE_BYTES = int(os.environ.get("COPILOT_MAX_INPUT_IMAGE_BYTES", str(20 * 1024 * 1024)))
+
 # Outbound proxy for copilot.com / substrate.office.com / login.microsoftonline.com,
 # e.g. http://192.168.1.10:7890 or socks5h://host:1080. Needed where those hosts
 # are unreachable directly. COPILOT_PROXY wins; HTTPS_PROXY / ALL_PROXY are fallbacks.
