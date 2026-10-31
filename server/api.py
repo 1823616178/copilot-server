@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from copilot import CopilotClient
 from copilot.driver import ClearanceRequired
 
-from .config import MODEL_NAME, RATE_LIMIT_BURST, RATE_LIMIT_RPM
+from .config import MODEL_NAME, RATE_LIMIT_BURST, RATE_LIMIT_RPM, PROXY
 from .openai_format import (
     completion_response,
     new_id,
@@ -32,7 +32,7 @@ app = FastAPI(title="Copilot OpenAI-compatible API", version="1.0.0")
 # Server must never pop a visible browser mid-request: chat and token refresh
 # are plain HTTP, and if the session is gone entirely the request fails with a
 # message to run `python -m copilot login` out of band.
-client = CopilotClient(interactive_clear=False)
+client = CopilotClient(interactive_clear=False, proxy=PROXY)
 
 _CLEARANCE_HELP = (
     "Copilot asked for human verification before answering. Open copilot.com in "

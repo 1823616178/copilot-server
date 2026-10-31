@@ -13,3 +13,10 @@ MODEL_NAME = "copilot"
 # upstream 502s, so the limiter only bites when callers try to exceed that.
 RATE_LIMIT_RPM = float(os.environ.get("RATE_LIMIT_RPM", "12"))  # 12 rpm ≈ 5s per call
 RATE_LIMIT_BURST = int(os.environ.get("RATE_LIMIT_BURST", "4"))
+
+# Outbound proxy for copilot.com / substrate.office.com / login.microsoftonline.com,
+# e.g. http://192.168.1.10:7890 or socks5h://host:1080. Needed where those hosts
+# are unreachable directly. COPILOT_PROXY wins; HTTPS_PROXY / ALL_PROXY are fallbacks.
+PROXY = (os.environ.get("COPILOT_PROXY") or os.environ.get("HTTPS_PROXY")
+         or os.environ.get("https_proxy") or os.environ.get("ALL_PROXY")
+         or os.environ.get("all_proxy") or None)

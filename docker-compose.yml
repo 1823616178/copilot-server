@@ -18,6 +18,9 @@ services:
       # Self-imposed rate limit (see server/config.py). Tune to your account.
       RATE_LIMIT_RPM: "12"
       RATE_LIMIT_BURST: "4"
+      # If substrate.office.com is unreachable from this host, route through a proxy:
+      # e.g. COPILOT_PROXY=http://192.168.1.x:7890 docker compose up -d (or put it in .env)
+      COPILOT_PROXY: "${COPILOT_PROXY:-}"
     volumes:
       # Persist the signed-in browser profile + cached token across restarts.
       # Sign in once on the host (`python -m copilot login`) so this folder is
