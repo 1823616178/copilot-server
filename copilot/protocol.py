@@ -41,14 +41,18 @@ CHAT_SCOPE = "https://substrate.office.com/sydney/v2/.default openid profile off
 TOKEN_ORIGIN = "https://copilot.com"  # SPA refresh tokens are only redeemable cross-origin
 
 # --- chat socket query string (besides the per-turn ids and token) ------------
+# Copilot Pro / Microsoft 365 Personal-Family subscribers get "Premium" (what the
+# web client sends for them); set COPILOT_LICENSE=Free for a free account.
+import os as _os
+_LICENSE = "Free" if _os.environ.get("COPILOT_LICENSE", "Premium").strip().lower() == "free" else "Premium"
 HUB_PARAMS = {
     "source": '"officeweb"',
     "product": "Office",
     "agentHost": "Bizchat.FullScreen",
-    "licenseType": "Free",
+    "licenseType": _LICENSE,
     "isEdu": "false",
     "agent": "web",
-    "scenario": "OfficeWebFreeConsumerCopilot",
+    "scenario": f"OfficeWeb{_LICENSE}ConsumerCopilot",
 }
 
 # Feature flags the web client sends on the socket URL, replayed verbatim.
@@ -119,12 +123,39 @@ def _client_info(session_id: str) -> dict:
     }
 
 
+def _iana_timezone(hours):
+    """Local IANA zone name (e.g. "Asia/Shanghai").
+
+    On Windows tzname() returns a localized display name (e.g. a Chinese
+    "China Standard Time"), which copilot.com rejects with InvalidRequest, so
+    prefer tzlocal / TZ and fall back to an Etc/GMT zone built from the offset.
+    """
+    import os
+    try:
+        from tzlocal import get_localzone_name  # optional dependency
+        name = get_localzone_name()
+        if name and "/" in name:
+            return name
+    except Exception:
+        pass
+    env = os.environ.get("TZ", "")
+    if "/" in env:
+        return env
+    if hours == int(hours):
+        h = int(hours)
+        return "UTC" if h == 0 else "Etc/GMT%s%d" % ("-" if h > 0 else "+", abs(h))
+    return "UTC"
+
+
 def _location_info() -> dict:
     now = datetime.now().astimezone()
     offset = now.utcoffset()
+    hours = offset.total_seconds() / 3600 if offset else 0
+    if hours == int(hours):
+        hours = int(hours)
     return {
-        "timeZoneOffset": offset.total_seconds() / 3600 if offset else 0,
-        "timeZone": now.tzname() or "UTC",
+        "timeZoneOffset": hours,
+        "timeZone": _iana_timezone(hours),
     }
 
 
