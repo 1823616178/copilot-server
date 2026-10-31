@@ -32,7 +32,7 @@ def app(host=None, port=None) -> None:
     """
     import uvicorn
 
-    from copilot.auth import load_auth
+    from copilot.auth import can_open_browser, load_auth
 
     if host is None:
         host = os.environ.get("HOST", "127.0.0.1")
@@ -43,7 +43,8 @@ def app(host=None, port=None) -> None:
     # very first run this triggers the interactive browser sign-in (instead of
     # letting the first HTTP request fail), then caches it for reuse.
     try:
-        load_auth()
+        # Headless (Docker / no DISPLAY): never try to pop a sign-in window.
+        load_auth(auto_login=can_open_browser())
     except Exception as exc:
         print(f"Warning: could not establish a Copilot session: {exc}")
 

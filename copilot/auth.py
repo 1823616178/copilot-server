@@ -8,6 +8,9 @@ expired, and for the very first sign-in.
 """
 
 import json
+import os
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -20,13 +23,39 @@ from .protocol import (
 )
 
 # All session state (browser profile + cached auth) lives under one folder.
-SESSION_DIR = "session"
-DEFAULT_PROFILE_DIR = f"{SESSION_DIR}/profile"
-DEFAULT_AUTH_FILE = f"{SESSION_DIR}/token.json"
+# Override with COPILOT_SESSION_DIR / COPILOT_AUTH_FILE / COPILOT_PROFILE_DIR
+# (e.g. a Docker volume holding a token.json copied from another machine).
+SESSION_DIR = os.environ.get("COPILOT_SESSION_DIR", "session")
+DEFAULT_PROFILE_DIR = os.environ.get("COPILOT_PROFILE_DIR", f"{SESSION_DIR}/profile")
+DEFAULT_AUTH_FILE = os.environ.get("COPILOT_AUTH_FILE", f"{SESSION_DIR}/token.json")
 # Chat access tokens live ~8h; this caps how long a cached one is trusted.
 AUTH_MAX_AGE = 7 * 60 * 60
 # Renew this long before the token's own expiry.
 _EXPIRY_MARGIN = 5 * 60
+# Refresh tokens rotate: two threads redeeming the same one at once can leave
+# the cache holding a token Microsoft has already invalidated. Serialize it.
+_AUTH_LOCK = threading.RLock()
+
+
+class NotSignedIn(RuntimeError):
+    """No usable session and no way to sign in (e.g. headless server)."""
+
+
+def can_open_browser() -> bool:
+    """True when a visible sign-in window can be shown.
+
+    ``COPILOT_HEADLESS=1`` forces False (Docker/servers); on Linux a window
+    needs ``DISPLAY`` or ``WAYLAND_DISPLAY``.
+    """
+    if os.environ.get("COPILOT_HEADLESS", "").lower() in ("1", "true", "yes"):
+        return False
+    if sys.platform.startswith("linux"):
+        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    return True
+
+
+def _log(msg: str) -> None:
+    print(f"[copilot.auth] {msg}", file=sys.stderr, flush=True)
 
 
 def auth_from_token_response(body: dict, oid: str, anchor: str, stamp: float) -> dict:
@@ -44,7 +73,14 @@ def auth_from_token_response(body: dict, oid: str, anchor: str, stamp: float) ->
 def save_auth(auth: dict, path: str = DEFAULT_AUTH_FILE) -> dict:
     dest = Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(json.dumps(auth, indent=2), encoding="utf-8")
+    # Atomic replace so a crash mid-write never leaves a truncated token file.
+    tmp = dest.with_name(dest.name + ".tmp")
+    tmp.write_text(json.dumps(auth, indent=2), encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, dest)
     return auth
 
 
@@ -76,9 +112,14 @@ def refresh_auth(auth: dict, proxy: Optional[str] = None) -> Optional[dict]:
                 headers={"Origin": TOKEN_ORIGIN},
             )
         body = response.json()
-    except Exception:
+    except Exception as exc:
+        _log(f"token refresh request failed: {type(exc).__name__}: {exc}")
         return None
     if response.status_code != 200 or "access_token" not in body:
+        # Log only the error code/description, never tokens.
+        desc = str(body.get("error_description", "")).splitlines()[:1]
+        _log(f"token refresh rejected (HTTP {response.status_code}): "
+             f"{body.get('error')} {desc[0] if desc else ''}")
         return None
     renewed = auth_from_token_response(body, auth["oid"], auth.get("anchor"), time.time())
     # Some responses omit a new refresh token; keep the old one then.
@@ -109,6 +150,11 @@ def load_auth(
         Copilot().create_completion(..., access_token=auth["access_token"],
                                     oid=auth["oid"])
     """
+    with _AUTH_LOCK:
+        return _load_auth(path, profile_dir, max_age, proxy, auto_login, force)
+
+
+def _load_auth(path, profile_dir, max_age, proxy, auto_login, force) -> dict:
     cached: dict = {}
     p = Path(path)
     if p.exists():
@@ -127,20 +173,29 @@ def load_auth(
         if renewed:
             return save_auth(renewed, path)
 
-    from .browser import BrowserCopilot
+    auth = None
+    if Path(profile_dir).is_dir():
+        # Refresh token expired: a signed-in profile can still mint a new one.
+        try:
+            from .browser import BrowserCopilot
 
-    # Refresh token expired: a signed-in profile can still mint a new one.
-    bot = BrowserCopilot(profile_dir=profile_dir, headless=True, proxy=proxy)
-    try:
-        bot.start()
-        auth = bot.capture_auth()
-    finally:
-        bot.close()
+            bot = BrowserCopilot(profile_dir=profile_dir, headless=True, proxy=proxy)
+            try:
+                bot.start()
+                auth = bot.capture_auth()
+            finally:
+                bot.close()
+        except Exception as exc:  # no Chromium / unusable profile on a server
+            _log(f"headless browser token capture failed: {exc}")
     if auth:
         return save_auth(auth, path)
 
-    if not auto_login:
-        raise RuntimeError(
+    if not auto_login or not can_open_browser():
+        raise NotSignedIn(
+            f"Not signed in: {path} is missing or its refresh token was rejected. "
+            "Sign in on a machine with a desktop (`python -m copilot login`) and "
+            f"copy session/token.json to {path}. "
+            if not can_open_browser() else
             "Not signed in (no Copilot token in the browser profile). "
             "Run `python -m copilot login` and sign in first."
         )

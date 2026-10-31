@@ -20,6 +20,13 @@ from .prompt import messages_to_prompt
 from .ratelimit import TokenBucket
 from .schemas import ChatCompletionRequest
 
+import logging
+
+from copilot.auth import NotSignedIn
+from copilot.driver import AuthExpired
+
+logger = logging.getLogger("copilot.server")
+
 app = FastAPI(title="Copilot OpenAI-compatible API", version="1.0.0")
 # Server must never pop a visible browser mid-request: chat and token refresh
 # are plain HTTP, and if the session is gone entirely the request fails with a
@@ -91,6 +98,7 @@ def _stream(prompt: str, model: str, conversation_id=None):
             stream_chunk(cid, created, model, {"content": f"\n[error: {_CLEARANCE_HELP}]"}, finish="error")
         )
     except Exception as exc:  # surface errors to the client instead of hanging
+        logger.warning("stream failed: %s: %s", type(exc).__name__, exc)
         yield sse_event(
             stream_chunk(cid, created, model, {"content": f"\n[error: {exc}]"}, finish="error")
         )
@@ -136,12 +144,31 @@ def chat_completions(req: ChatCompletionRequest):
             status_code=503,
             content={"error": {"message": _CLEARANCE_HELP, "type": "clearance_required"}},
         )
+    except (NotSignedIn, AuthExpired) as exc:
+        return JSONResponse(
+            status_code=401,
+            content={"error": {"message": str(exc), "type": "authentication_error"}},
+        )
+    except TimeoutError as exc:
+        return JSONResponse(
+            status_code=504,
+            content={"error": {"message": str(exc), "type": "upstream_timeout"}},
+        )
     except Exception as exc:
+        logger.warning("chat failed: %s: %s", type(exc).__name__, exc)
         return JSONResponse(
             status_code=502,
             content={"error": {"message": str(exc), "type": "upstream_error"}},
         )
     return completion_response(reply.text, model, reply.conversation_id)
+
+
+@app.get("/healthz")
+def healthz():
+    """Liveness + whether a cached token exists (no upstream call)."""
+    from copilot.auth import DEFAULT_AUTH_FILE
+    import os.path
+    return {"status": "ok", "token_file": os.path.exists(DEFAULT_AUTH_FILE)}
 
 
 @app.get("/")

@@ -117,6 +117,10 @@ docker build -t windows-copilot-api .
 docker run --rm -p 8000:8000 -v "$(pwd)/session:/app/session" windows-copilot-api
 ```
 
+**Headless server notes (fork).** The container sets `COPILOT_HEADLESS=1`, so it never tries to open a sign-in window; without a valid session requests return HTTP 401 with instructions. Sign in on a desktop, then copy only `session/token.json` to the server's `./session/` (the Chromium profile is not portable between Windows and Linux). The access token is renewed over plain HTTP with the refresh token and the rotated refresh token is written back to `token.json`, so keep the volume writable. If refresh fails (refresh token expired/revoked), sign in again on the desktop and re-copy `token.json`. Override paths with `COPILOT_AUTH_FILE` / `COPILOT_PROFILE_DIR`, the license with `COPILOT_LICENSE=Free|Premium`. `GET /healthz` reports liveness.
+
+**Timezone fix.** copilot.com rejects non-IANA timezone names (e.g. `中国标准时间` on Chinese Windows) with `InvalidRequest`; the client now sends an IANA zone (tzlocal / `TZ` / `Etc/GMT±N`).
+
 ---
 
 ## Usage 1: In Python (no server)
