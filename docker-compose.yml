@@ -10,7 +10,7 @@ services:
         PIP_RETRIES: "${COPILOT_PIP_RETRIES:-3}"
     image: windows-copilot-api
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       # Bind inside the container; the host port is set under `ports` above.
       HOST: "0.0.0.0"

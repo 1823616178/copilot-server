@@ -5,9 +5,12 @@ import math
 import os
 import threading
 import time
+from concurrent.futures import CancelledError
+from contextlib import contextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from copilot import CopilotClient
 from copilot.driver import ClearanceRequired
@@ -23,8 +26,10 @@ from .openai_format import (
     stream_chunk,
 )
 from .prompt import image_urls, messages_to_prompt
+from .images import download_image, load_images
 from .ratelimit import TokenBucket
 from .schemas import ChatCompletionRequest, ImageGenerationRequest
+from .streaming import CancellableStreamingResponse
 from copilot.models import ImageResponse, ReasoningChunk
 
 import logging
@@ -77,8 +82,22 @@ def _rate_limited_response():
 _upstream_lock = threading.Lock()
 
 
+@contextmanager
+def _stream_turn(cancel_event):
+    # A disconnected queued request must not start a new Copilot turn.
+    while not _upstream_lock.acquire(timeout=0.1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError()
+    try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError()
+        yield
+    finally:
+        _upstream_lock.release()
+
+
 def _stream(prompt: str, model: str, conversation_id=None, images=None, mode="auto",
-            include_reasoning=True):
+            include_reasoning=True, cancel_event=None):
     """Yield OpenAI ``chat.completion.chunk`` SSE events for ``prompt``.
 
     ``conversation_id`` continues an existing Copilot thread; ``None`` starts a
@@ -87,27 +106,36 @@ def _stream(prompt: str, model: str, conversation_id=None, images=None, mode="au
     cid = new_id()
     created = int(time.time())
     try:
-        with _upstream_lock:  # one upstream chat at a time (released on disconnect)
+        with _stream_turn(cancel_event):
             yield sse_event(stream_chunk(cid, created, model, {"role": "assistant"}))
             stream = client.stream(prompt, conversation_id=conversation_id, images=images or None,
-                                   tone=MODE_TONES[mode])
-            for piece in stream:
-                if isinstance(piece, str) and piece:
-                    yield sse_event(stream_chunk(cid, created, model, {"content": piece}))
-                elif isinstance(piece, ReasoningChunk):
-                    if include_reasoning and piece.text:
-                        yield sse_event(stream_chunk(cid, created, model,
-                                                     {"reasoning_content": piece.text}))
-                elif isinstance(piece, ImageResponse):
-                    md = _image_markdown(piece)
-                    if md:
-                        yield sse_event(stream_chunk(cid, created, model, {"content": md}))
+                                   tone=MODE_TONES[mode], cancel_event=cancel_event)
+            try:
+                for piece in stream:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise CancelledError()
+                    if isinstance(piece, str) and piece:
+                        yield sse_event(stream_chunk(cid, created, model, {"content": piece}))
+                    elif isinstance(piece, ReasoningChunk):
+                        if include_reasoning and piece.text:
+                            yield sse_event(stream_chunk(cid, created, model,
+                                                         {"reasoning_content": piece.text}))
+                    elif isinstance(piece, ImageResponse):
+                        md = _image_markdown(piece)
+                        if md:
+                            yield sse_event(stream_chunk(cid, created, model, {"content": md}))
+            finally:
+                close = getattr(stream, "close", None)
+                if close is not None:
+                    close()
             # Copilot's conversation id is known once the stream has run; emit it
             # on the final chunk so callers can track the upstream thread.
             final = stream_chunk(cid, created, model, {}, finish="stop",
                                  conversation_id=stream.conversation_id)
             final["copilot_mode"] = mode
             yield sse_event(final)
+    except CancelledError:
+        return
     except ClearanceRequired:
         yield sse_event(
             stream_chunk(cid, created, model, {"content": f"\n[error: {_CLEARANCE_HELP}]"}, finish="error")
@@ -134,7 +162,8 @@ def list_models():
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest):
     prompt = messages_to_prompt(req.messages)
-    if not prompt.strip():
+    sources = image_urls(req.messages)
+    if not prompt.strip() and not sources:
         return JSONResponse(
             status_code=400,
             content={"error": {"message": "no text content in messages", "type": "invalid_request_error"}},
@@ -146,21 +175,22 @@ def chat_completions(req: ChatCompletionRequest):
                             reasoning=req.reasoning)
     except ValueError as exc:
         return _bad_request(str(exc))
-    try:
-        images = _load_images(image_urls(req.messages))
-    except ValueError as exc:
-        return _bad_request(str(exc))
-
-    # Enforce the per-minute ceiling before touching the upstream lock, so excess
-    # callers get a fast 429 instead of piling up behind the serialized queue.
+    # Reject excess requests before downloading or decoding any images.
     limited = _rate_limited_response()
     if limited is not None:
         return limited
+    try:
+        images = _load_images(sources)
+    except ValueError as exc:
+        return _bad_request(str(exc))
+    if not prompt.strip():
+        prompt = "Describe the uploaded image(s)."
 
     if req.stream:
-        return StreamingResponse(
-            _stream(prompt, model, req.conversation_id, images, mode,
-                    _include_reasoning(req)), media_type="text/event-stream"
+        return CancellableStreamingResponse(
+            lambda cancel: _stream(prompt, model, req.conversation_id, images, mode,
+                                   _include_reasoning(req), cancel_event=cancel),
+            media_type="text/event-stream"
         )
 
     try:
@@ -217,12 +247,8 @@ def _image_markdown(img: ImageResponse) -> str:
 def _fetch_b64(url: str) -> str:
     if url.startswith("data:"):
         return url.split(",", 1)[1]
-    from curl_cffi.requests import Session
-
-    with Session(impersonate="chrome", proxy=PROXY, timeout=60) as s:
-        r = s.get(url)
-        r.raise_for_status()
-        return base64.b64encode(r.content).decode()
+    data, _ = download_image(url, MAX_INPUT_IMAGE_BYTES)
+    return base64.b64encode(data).decode()
 
 
 def _bad_request(msg: str):
@@ -230,53 +256,10 @@ def _bad_request(msg: str):
 
 
 def _load_images(sources) -> list:
-    """Turn data:/http(s) URLs, raw bytes or (bytes, mime) into ``(bytes, mime)``."""
-    if len(sources) > MAX_INPUT_IMAGES:
-        raise ValueError(f"too many images ({len(sources)}); at most {MAX_INPUT_IMAGES} per request")
-    out = []
-    for src in sources:
-        if isinstance(src, tuple):
-            data, mime = src
-        elif isinstance(src, (bytes, bytearray)):
-            data, mime = bytes(src), None
-        elif isinstance(src, str) and src.startswith("data:"):
-            head, _, b64 = src.partition(",")
-            try:
-                data = base64.b64decode(b64)
-            except Exception:
-                raise ValueError("invalid base64 in data: URL")
-            mime = head[5:].split(";", 1)[0]
-        elif isinstance(src, str) and src.startswith(("http://", "https://")):
-            from curl_cffi.requests import Session
-            try:
-                with Session(impersonate="chrome", proxy=PROXY, timeout=60) as s:
-                    r = s.get(src)
-                    r.raise_for_status()
-            except Exception as exc:
-                raise ValueError(f"could not download image {src[:100]}: {exc}")
-            data, mime = r.content, (r.headers.get("content-type") or "").split(";")[0] or None
-        elif isinstance(src, str) and src:
-            try:  # bare base64
-                data, mime = base64.b64decode(src, validate=True), None
-            except Exception:
-                raise ValueError("image must be a data: URL, http(s) URL or base64 string")
-        else:
-            raise ValueError("empty image")
-        if not data:
-            raise ValueError("empty image")
-        if len(data) > MAX_INPUT_IMAGE_BYTES:
-            raise ValueError(f"image too large ({len(data)} bytes; limit {MAX_INPUT_IMAGE_BYTES})")
-        from copilot.driver import _sniff_mime
-        if not mime or not mime.startswith("image/") or mime == "application/octet-stream":
-            mime = _sniff_mime(data)
-        out.append((data, mime.lower()))
-    return out
+    return load_images(sources, MAX_INPUT_IMAGES, MAX_INPUT_IMAGE_BYTES)
 
 
 def _image_api(prompt: str, n, response_format, images=None):
-    limited = _rate_limited_response()
-    if limited is not None:
-        return limited
     try:
         with _upstream_lock:
             reply = client.chat(prompt, images=images or None)
@@ -303,6 +286,9 @@ def _image_api(prompt: str, n, response_format, images=None):
 @app.post("/v1/images/generations")
 def images_generations(req: ImageGenerationRequest):
     """OpenAI Images API shim: asks Copilot to draw ``prompt``."""
+    limited = _rate_limited_response()
+    if limited is not None:
+        return limited
     return _image_api(f"请生成一张图片：{req.prompt}", req.n, req.response_format)
 
 
@@ -319,41 +305,52 @@ async def images_edits(request: Request):
     """
     from starlette.concurrency import run_in_threadpool
 
+    limited = _rate_limited_response()
+    if limited is not None:
+        return limited
     ctype = request.headers.get("content-type", "")
     sources = []
-    if ctype.startswith("multipart/form-data"):
-        form = await request.form()
-        prompt = form.get("prompt") or ""
-        n, fmt = form.get("n") or 1, form.get("response_format") or "url"
-        for key in ("image", "image[]", "images", "images[]"):
-            for f in form.getlist(key):
-                if hasattr(f, "read"):
-                    sources.append((await f.read(), getattr(f, "content_type", None)))
-                elif isinstance(f, str) and f:
-                    sources.append(f)
-    else:
-        try:
-            body = await request.json()
-        except Exception:
-            return _bad_request("expected multipart/form-data or JSON body")
-        prompt = body.get("prompt") or ""
-        n, fmt = body.get("n") or 1, body.get("response_format") or "url"
-        imgs = body.get("images") if body.get("images") is not None else body.get("image")
-        for item in (imgs if isinstance(imgs, list) else [imgs] if imgs else []):
-            if isinstance(item, dict):
-                item = item.get("image_url") or item.get("url") or item.get("b64_json") or ""
-                item = item.get("url", "") if isinstance(item, dict) else item
-            sources.append(item)
-    if not str(prompt).strip():
-        return _bad_request("prompt is required")
-    if not sources:
-        return _bad_request("at least one image is required")
     try:
-        n = int(n)
+        if ctype.startswith("multipart/form-data"):
+            async with request.form(max_files=MAX_INPUT_IMAGES + 1, max_fields=20) as form:
+                options = ImageGenerationRequest(
+                    prompt=form.get("prompt"), n=form.get("n", 1),
+                    response_format=form.get("response_format", "url"))
+                files = [f for key, f in form.multi_items()
+                         if key in ("image", "image[]", "images", "images[]")]
+                if len(files) > MAX_INPUT_IMAGES:
+                    raise ValueError(f"at most {MAX_INPUT_IMAGES} images per request")
+                for f in files:
+                    if hasattr(f, "read"):
+                        data = await f.read(MAX_INPUT_IMAGE_BYTES + 1)
+                        if len(data) > MAX_INPUT_IMAGE_BYTES:
+                            raise ValueError(f"image too large (limit {MAX_INPUT_IMAGE_BYTES} bytes)")
+                        sources.append((data, f.content_type))
+                    else:
+                        sources.append(f)
+        else:
+            try:
+                body = await request.json()
+            except ValueError:
+                return _bad_request("expected multipart/form-data or JSON body")
+            if not isinstance(body, dict):
+                return _bad_request("expected a JSON object")
+            options = ImageGenerationRequest(**body)
+            imgs = body.get("images") if body.get("images") is not None else body.get("image")
+            for item in (imgs if isinstance(imgs, list) else [imgs] if imgs is not None else []):
+                if isinstance(item, dict):
+                    item = item.get("image_url") or item.get("url") or item.get("b64_json") or ""
+                    item = item.get("url", "") if isinstance(item, dict) else item
+                sources.append(item)
+        if not sources:
+            raise ValueError("at least one image is required")
         images = await run_in_threadpool(_load_images, sources)
+    except ValidationError as exc:
+        return _bad_request(f"invalid image parameters: {exc.errors()[0]['msg']}")
     except ValueError as exc:
         return _bad_request(str(exc))
-    return await run_in_threadpool(_image_api, EDIT_PROMPT.format(prompt=prompt), n, fmt, images)
+    return await run_in_threadpool(_image_api, EDIT_PROMPT.format(prompt=options.prompt),
+                                  options.n, options.response_format, images)
 
 
 @app.get("/healthz")

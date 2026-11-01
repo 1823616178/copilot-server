@@ -369,6 +369,7 @@ class TurnParser:
             replies = [m["text"] for m in messages if _is_reply(m)]
             chunks = self._sync(replies[-1]) if replies else []
             for m in messages:
+                chunks.extend(self._collect_reasoning(m))
                 chunks.extend(self._collect_images(m))
             return chunks + self._flush_data_images()
         if kind == 3:  # invocation completion

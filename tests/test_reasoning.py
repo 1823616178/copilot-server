@@ -134,6 +134,21 @@ class ReasoningContentTests(unittest.TestCase):
         self.assertEqual("".join(c.text for c in out), "**Step** one two\n\nnext")
         self.assertEqual(p.text, "")
 
+    def test_final_snapshot_collects_summary_without_duplicates(self):
+        from copilot.protocol import TurnParser
+        from copilot.models import ReasoningChunk
+        for with_progress in (False, True):
+            with self.subTest(with_progress=with_progress):
+                parser = TurnParser()
+                out = parser.feed(self._cot("a", "step")) if with_progress else []
+                final = self._cot("a", "step finished")["arguments"][0]["messages"]
+                final.append({"author": "bot", "messageType": "Chat", "text": "answer"})
+                out.extend(parser.feed({"type": 2, "item": {"messages": final, "result": {"value": "Success"}}}))
+                out.extend(parser.feed({"type": 2, "item": {"messages": final}}))
+                self.assertEqual("".join(p.text for p in out if isinstance(p, ReasoningChunk)), "step finished")
+                self.assertEqual(parser.reasoning, "step finished")
+                self.assertEqual(parser.text, "answer")
+
     @patch("server.api._rate_limiter.try_acquire", return_value=(True, 0))
     @patch("server.api.client.chat", return_value=ChatReply("ok", "c1", [], "thinking..."))
     def test_nonstream_reasoning_content(self, _chat, _acq):

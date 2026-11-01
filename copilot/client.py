@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Generator, List, Optional, Union
 
 from .auth import AUTH_MAX_AGE, load_auth
-from .driver import AuthExpired, Copilot
+from .driver import AuthExpired, Copilot, _check_cancelled
 from .models import Conversation, ImageResponse, ReasoningChunk
 
 
@@ -65,12 +65,19 @@ class ChatStream:
         self._chunks = chunks
         self.conversation_id = conversation_id
 
-    def __iter__(self) -> Generator[Union[str, ImageResponse], None, None]:
-        for item in self._chunks:
-            if isinstance(item, Conversation):
-                self.conversation_id = item.conversation_id
-            else:
-                yield item
+    def __iter__(self) -> Generator[Union[str, ImageResponse, ReasoningChunk], None, None]:
+        try:
+            for item in self._chunks:
+                if isinstance(item, Conversation):
+                    self.conversation_id = item.conversation_id
+                else:
+                    yield item
+        finally:
+            self.close()
+
+    def close(self):
+        """Close the underlying generator and its upstream connection."""
+        self._chunks.close()
 
 
 class CopilotClient:
@@ -134,6 +141,7 @@ class CopilotClient:
     def _stream_with_recovery(self, prompt, conversation_id, kwargs):
         """Drive the turn; on a rejected token, refresh it and retry once."""
         for attempt in range(2):
+            _check_cancelled(kwargs.get("cancel_event"))
             auth = self._fresh_auth(force=attempt > 0)
             kw = dict(
                 stream=True,
@@ -149,8 +157,9 @@ class CopilotClient:
                 kw["conversation_id"] = conversation_id
 
             produced = False  # any user-visible output yet? (Conversation doesn't count)
+            chunks = self._driver.create_completion(prompt, **kw)
             try:
-                for item in self._driver.create_completion(prompt, **kw):
+                for item in chunks:
                     if not isinstance(item, Conversation):
                         produced = True
                     yield item
@@ -159,6 +168,8 @@ class CopilotClient:
                 if produced or attempt:
                     raise
                 _status("Access token rejected — refreshing it and retrying...")
+            finally:
+                chunks.close()
 
     def chat(
         self,

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from curl_cffi.requests import CurlWsFlag
+from curl_cffi.curl import CurlError
 
 from copilot.driver import Copilot
 from copilot.protocol import encode
@@ -85,3 +86,12 @@ class StreamTests(unittest.TestCase):
         with patch.object(self.driver, "_recv_frame", side_effect=ValueError("invalid")):
             with self.assertRaises(ValueError):
                 list(self.driver._read_stream(Mock(), 30))
+
+    def test_close_frame_failure_still_terminates_socket(self):
+        with patch("copilot.driver.Session") as session:
+            socket = session.return_value.__enter__.return_value.ws_connect.return_value
+            socket.send.side_effect = CurlError("handshake failed")
+            socket.close.side_effect = CurlError("close failed")
+            with self.assertRaisesRegex(CurlError, "handshake failed"):
+                list(self.driver.create_completion("q", access_token="test", oid="test"))
+            socket.terminate.assert_called_once()

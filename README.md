@@ -25,6 +25,8 @@ You sign in once in a browser with your Microsoft **or Google** account; your se
 - [Run with Docker (optional)](#run-with-docker-optional)
 - [Usage 1: In Python (no server)](#usage-1-in-python-no-server)
 - [Usage 2: As an OpenAI-compatible server](#usage-2-as-an-openai-compatible-server)
+- [Images](#images)
+- [Thinking mode](#thinking-mode-reasoning-effort)
 - [Command line](#command-line)
 - [Concurrency & stress test](#concurrency--stress-test)
 - [Rate limiting](#rate-limiting)
@@ -48,7 +50,7 @@ You sign in once in a browser with your Microsoft **or Google** account; your se
 
 ## Requirements
 
-- **Python 3.9+**
+- **Python 3.10+**
 - A **Microsoft account** (the free one you use for Copilot is fine)
 - Works on Windows, macOS, and Linux
 
@@ -110,12 +112,16 @@ docker compose up --build
 # -> Copilot OpenAI-compatible API on http://localhost:8000
 ```
 
-The [docker-compose.yml](docker-compose.yml) maps port `8000` and bind-mounts your `session/` so the login persists across restarts. Tune `RATE_LIMIT_RPM` / `RATE_LIMIT_BURST` there. To run without Compose, build and pass the same bindings by hand:
+The [docker-compose.yml](docker-compose.yml) maps port `8000` on `127.0.0.1` and bind-mounts your `session/` so the login persists across restarts. Tune `RATE_LIMIT_RPM` / `RATE_LIMIT_BURST` there. To run without Compose, build and pass the same bindings by hand:
 
 ```bash
 docker build -t windows-copilot-api .
-docker run --rm -p 8000:8000 -v "$(pwd)/session:/app/session" windows-copilot-api
+docker run --rm -p 127.0.0.1:8000:8000 -v "$(pwd)/session:/app/session" windows-copilot-api
 ```
+
+The API uses your signed-in account and has no inbound API-key authentication.
+For access from other machines, put it behind an authenticated reverse proxy
+before changing the host port binding.
 
 **Slow builds / PyPI connection timeouts.** The package index is configurable.
 The default is official PyPI; if it is unreachable, try the HTTPS
@@ -233,11 +239,35 @@ curl http://localhost:8000/v1/chat/completions \
 | Method | Path | Description |
 | --- | --- | --- |
 | `POST` | `/v1/chat/completions` | Chat (supports `"stream": true` and an optional `"conversation_id"`) |
-| `GET`  | `/v1/models` | Lists the single `copilot` model |
+| `GET`  | `/v1/models` | Lists `copilot` and the quick/auto/deep mode aliases |
+| `POST` | `/v1/images/generations` | Generate an image from a prompt |
+| `POST` | `/v1/images/edits` | Generate an image using uploaded reference images |
 
 > Change the address with env vars: `HOST=0.0.0.0 PORT=8080 python app.py`, or run `uvicorn server.api:app --host 0.0.0.0 --port 8080`.
 
 👉 More: [examples/04_server_http.py](examples/04_server_http.py), [05_server_stream.py](examples/05_server_stream.py), [06_server_openai_sdk.py](examples/06_server_openai_sdk.py)
+
+---
+
+## Images
+
+Chat messages accept OpenAI `image_url` content parts alongside text, or by
+themselves (the server asks Copilot to describe the images). Reference images
+can also be sent to `/v1/images/edits` as multipart `image` / `image[]` files,
+or JSON `image` / `images` containing data URLs, bare base64 or public HTTP(S)
+URLs. Edits require a nonblank `prompt`.
+
+Both Images endpoints accept `n` from 1 to 10 and `response_format` of `url`
+(default) or `b64_json`. `n` caps the number of images returned; Copilot can
+produce fewer. Chat responses include generated images as Markdown links.
+
+Reference images are limited to 4 per request and 20 MiB each. Override with
+`COPILOT_MAX_INPUT_IMAGES` and `COPILOT_MAX_INPUT_IMAGE_BYTES`. Oversized downloads
+are aborted while reading; rate-limited requests do not download images.
+Remote image URLs and their redirects must resolve only to public addresses.
+Downloads pin the validated DNS results and connect directly, without an outbound
+proxy; `COPILOT_PROXY` still applies to Copilot chat, uploads and token refresh.
+If direct image downloads are unavailable, send base64 or upload a file instead.
 
 ---
 
@@ -387,8 +417,8 @@ add a few retries yourself.
 
 - **Sign in once, then reuse.** The cached token refreshes automatically over HTTP; you only re-sign-in if the session fully expires.
 - **Daily allowance.** The free copilot.com tier meters usage per day (the reply metadata shows a daily quota that resets at midnight UTC). Use it in moderation, and don't hammer it with automated bulk requests.
-- **Text only for now.** Image input isn't supported on the new copilot.com backend yet.
-- **One model.** Copilot has no model picker, so the server advertises a single model named `copilot`.
+- **Images supported.** Chat accepts reference images; the Images endpoints support generation and editing with references. Edits ignore `mask`.
+- **Response modes.** `copilot` uses the configured default; model aliases select quick, auto or deep thinking. These select Copilot response modes rather than named underlying models.
 - **Roughly GPT-4 class.** On GPQA Diamond (198 graduate-level questions, closed-book) it scores **40.9%**, which puts it in the GPT-4 family rather than the reasoning tier (o1/o3). Measured with [tests/gpqa_bench.py](tests/gpqa_bench.py).
 - **Your session is private.** Everything in `session/` (browser profile + tokens) stays on your machine and is git-ignored.
 

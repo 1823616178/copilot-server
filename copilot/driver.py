@@ -9,6 +9,7 @@ only used to sign in and, as a fallback, to mint a fresh token.
 
 import time
 import uuid
+from concurrent.futures import CancelledError
 from http.cookiejar import CookieJar
 from select import select
 from typing import Optional
@@ -57,6 +58,11 @@ def _sniff_mime(data: bytes) -> str:
 # and never returns on an idle socket, so we drive the fragment loop ourselves to
 # honour a deadline. CURL_SOCKET_BAD is libcurl's "no active socket" sentinel.
 _CURL_SOCKET_BAD = -1
+
+
+def _check_cancelled(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise CancelledError("Copilot request cancelled")
 
 
 class ClearanceRequired(RuntimeError):
@@ -114,6 +120,8 @@ class Copilot(AbstractProvider):
             images.insert(0, image)
         anchor = kwargs.pop("anchor", None)
         tone = kwargs.pop("tone", None) or "Magic"
+        cancel_event = kwargs.pop("cancel_event", None)
+        _check_cancelled(cancel_event)
         if conversation is not None:
             conversation_id = conversation.conversation_id
             access_token = access_token or conversation.access_token
@@ -129,6 +137,7 @@ class Copilot(AbstractProvider):
 
         annotations = []
         for i, img in enumerate(images):
+            _check_cancelled(cancel_event)
             annotations.append(self.upload_image(
                 img, access_token=access_token, oid=oid, tenant=tenant, anchor=anchor,
                 conversation_id=conversation_id, proxy=proxy, name=f"image{i + 1}"))
@@ -150,18 +159,27 @@ class Copilot(AbstractProvider):
 
         with Session(timeout=timeout, proxy=proxy, impersonate="chrome",
                      headers={"Origin": "https://copilot.com"}) as session:
+            _check_cancelled(cancel_event)
             try:
                 wss = session.ws_connect(websocket_url)
             except CurlError as exc:
                 if "401" in str(exc) or "403" in str(exc):
                     raise AuthExpired(f"Copilot rejected the access token: {exc}") from exc
                 raise
-            wss.send(HANDSHAKE, CurlWsFlag.TEXT)
-            wss.send(PING, CurlWsFlag.TEXT)
-            wss.send(encode(chat_frame(prompt, request_id, session_id, start_of_session,
-                                        annotations or None, tone=tone)),
-                     CurlWsFlag.TEXT)
-            yield from self._read_stream(wss, timeout)
+            try:
+                _check_cancelled(cancel_event)
+                wss.send(HANDSHAKE, CurlWsFlag.TEXT)
+                wss.send(PING, CurlWsFlag.TEXT)
+                wss.send(encode(chat_frame(prompt, request_id, session_id, start_of_session,
+                                          annotations or None, tone=tone)), CurlWsFlag.TEXT)
+                yield from self._read_stream(wss, timeout, cancel_event=cancel_event)
+            finally:
+                try:
+                    wss.close()
+                except CurlError:
+                    pass  # A broken peer may reject the close frame.
+                finally:
+                    wss.terminate()
 
     @staticmethod
     def upload_image(image, access_token: str, oid: str, tenant: str = MSA_TENANT,
@@ -201,7 +219,7 @@ class Copilot(AbstractProvider):
             raise RuntimeError(f"Copilot image upload failed (HTTP {r.status_code}): {msg}")
         return image_annotation(doc_id, f"{name}.{ext}", ext)
 
-    def _read_stream(self, wss, timeout: int, idle_timeout: int = 90):
+    def _read_stream(self, wss, timeout: int, idle_timeout: int = 90, cancel_event=None):
         """Consume hub records until the turn completes, yielding reply text.
 
         ``idle_timeout`` bounds how long we wait for the *next* frame, so a
@@ -211,11 +229,12 @@ class Copilot(AbstractProvider):
         buffer = b""
         overall_deadline = time.monotonic() + timeout
         while not parser.done:
+            _check_cancelled(cancel_event)
             if time.monotonic() >= overall_deadline:
                 raise TimeoutError(f"Copilot stream exceeded {timeout}s")
             idle_deadline = time.monotonic() + idle_timeout
             try:
-                chunk = self._recv_frame(wss, min(overall_deadline, idle_deadline))
+                chunk = self._recv_frame(wss, min(overall_deadline, idle_deadline), cancel_event)
             except (CurlError, ConnectionError, OSError) as exc:
                 raise ConnectionError("Copilot stream interrupted before completion") from exc
             if chunk is None:  # deadline passed with no frame
@@ -248,7 +267,7 @@ class Copilot(AbstractProvider):
         raise RuntimeError(f"Copilot error: {message}")
 
     @staticmethod
-    def _recv_frame(wss, deadline: float):
+    def _recv_frame(wss, deadline: float, cancel_event=None):
         """Block for one complete WS frame, or return ``None`` past ``deadline``.
 
         Reassembles libcurl's fragments like ``curl_cffi``'s own ``recv()`` but
@@ -261,6 +280,7 @@ class Copilot(AbstractProvider):
             raise ConnectionError("WebSocket has no active socket")
         chunks = []
         while True:
+            _check_cancelled(cancel_event)
             if time.monotonic() >= deadline:
                 return None
             try:

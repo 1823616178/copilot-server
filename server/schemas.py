@@ -1,8 +1,8 @@
 """Pydantic request models for the OpenAI-compatible endpoints."""
 
-from typing import Any, List, Optional, Union
+from typing import Any, List, Literal, Optional, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from .config import MODEL_NAME
 
@@ -41,8 +41,15 @@ class ChatCompletionRequest(BaseModel):
 class ImageGenerationRequest(BaseModel):
     """Subset of OpenAI's POST /v1/images/generations body."""
 
-    prompt: str
+    prompt: str = Field(min_length=1)
     model: Optional[str] = None
-    n: Optional[int] = 1
+    n: int = Field(default=1, ge=1, le=10)
     size: Optional[str] = None
-    response_format: Optional[str] = "url"  # "url" | "b64_json"
+    response_format: Literal["url", "b64_json"] = "url"
+
+    @field_validator("prompt")
+    @classmethod
+    def nonblank_prompt(cls, value):
+        if not value.strip():
+            raise ValueError("prompt must not be blank")
+        return value
