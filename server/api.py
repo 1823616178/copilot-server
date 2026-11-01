@@ -12,6 +12,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from copilot import CopilotClient
 from copilot.driver import ClearanceRequired
 
+from .reasoning import MODE_TONES, MODEL_MODES, resolve_mode
+from .config import INCLUDE_REASONING
 from .config import (MAX_INPUT_IMAGE_BYTES, MAX_INPUT_IMAGES, MODEL_NAME,
                      PROXY, RATE_LIMIT_BURST, RATE_LIMIT_RPM)
 from .openai_format import (
@@ -23,7 +25,7 @@ from .openai_format import (
 from .prompt import image_urls, messages_to_prompt
 from .ratelimit import TokenBucket
 from .schemas import ChatCompletionRequest, ImageGenerationRequest
-from copilot.models import ImageResponse
+from copilot.models import ImageResponse, ReasoningChunk
 
 import logging
 
@@ -75,7 +77,8 @@ def _rate_limited_response():
 _upstream_lock = threading.Lock()
 
 
-def _stream(prompt: str, model: str, conversation_id=None, images=None):
+def _stream(prompt: str, model: str, conversation_id=None, images=None, mode="auto",
+            include_reasoning=True):
     """Yield OpenAI ``chat.completion.chunk`` SSE events for ``prompt``.
 
     ``conversation_id`` continues an existing Copilot thread; ``None`` starts a
@@ -86,22 +89,25 @@ def _stream(prompt: str, model: str, conversation_id=None, images=None):
     try:
         with _upstream_lock:  # one upstream chat at a time (released on disconnect)
             yield sse_event(stream_chunk(cid, created, model, {"role": "assistant"}))
-            stream = client.stream(prompt, conversation_id=conversation_id, images=images or None)
+            stream = client.stream(prompt, conversation_id=conversation_id, images=images or None,
+                                   tone=MODE_TONES[mode])
             for piece in stream:
                 if isinstance(piece, str) and piece:
                     yield sse_event(stream_chunk(cid, created, model, {"content": piece}))
+                elif isinstance(piece, ReasoningChunk):
+                    if include_reasoning and piece.text:
+                        yield sse_event(stream_chunk(cid, created, model,
+                                                     {"reasoning_content": piece.text}))
                 elif isinstance(piece, ImageResponse):
                     md = _image_markdown(piece)
                     if md:
                         yield sse_event(stream_chunk(cid, created, model, {"content": md}))
             # Copilot's conversation id is known once the stream has run; emit it
             # on the final chunk so callers can track the upstream thread.
-            yield sse_event(
-                stream_chunk(
-                    cid, created, model, {}, finish="stop",
-                    conversation_id=stream.conversation_id,
-                )
-            )
+            final = stream_chunk(cid, created, model, {}, finish="stop",
+                                 conversation_id=stream.conversation_id)
+            final["copilot_mode"] = mode
+            yield sse_event(final)
     except ClearanceRequired:
         yield sse_event(
             stream_chunk(cid, created, model, {"content": f"\n[error: {_CLEARANCE_HELP}]"}, finish="error")
@@ -119,7 +125,8 @@ def list_models():
     return {
         "object": "list",
         "data": [
-            {"id": MODEL_NAME, "object": "model", "created": 0, "owned_by": "microsoft"}
+            {"id": name, "object": "model", "created": 0, "owned_by": "microsoft"}
+            for name in MODEL_MODES
         ],
     }
 
@@ -134,6 +141,12 @@ def chat_completions(req: ChatCompletionRequest):
         )
     model = req.model or MODEL_NAME
     try:
+        mode = resolve_mode(model=model, reasoning_effort=req.reasoning_effort,
+                            thinking=req.thinking, copilot_mode=req.copilot_mode,
+                            reasoning=req.reasoning)
+    except ValueError as exc:
+        return _bad_request(str(exc))
+    try:
         images = _load_images(image_urls(req.messages))
     except ValueError as exc:
         return _bad_request(str(exc))
@@ -146,12 +159,14 @@ def chat_completions(req: ChatCompletionRequest):
 
     if req.stream:
         return StreamingResponse(
-            _stream(prompt, model, req.conversation_id, images), media_type="text/event-stream"
+            _stream(prompt, model, req.conversation_id, images, mode,
+                    _include_reasoning(req)), media_type="text/event-stream"
         )
 
     try:
         with _upstream_lock:  # serialize: one upstream chat at a time
-            reply = client.chat(prompt, conversation_id=req.conversation_id, images=images or None)
+            reply = client.chat(prompt, conversation_id=req.conversation_id, images=images or None,
+                                tone=MODE_TONES[mode])
     except ClearanceRequired:
         return JSONResponse(
             status_code=503,
@@ -174,8 +189,18 @@ def chat_completions(req: ChatCompletionRequest):
             content={"error": {"message": str(exc), "type": "upstream_error"}},
         )
     text = reply.text + "".join(_image_markdown(i) for i in reply.images)
-    return completion_response(text.lstrip("\n") if not reply.text else text,
+    body = completion_response(text.lstrip("\n") if not reply.text else text,
                                model, reply.conversation_id)
+    body["copilot_mode"] = mode
+    if _include_reasoning(req) and getattr(reply, "reasoning", ""):
+        body["choices"][0]["message"]["reasoning_content"] = reply.reasoning
+    return body
+
+
+def _include_reasoning(req) -> bool:
+    if req.include_reasoning is not None:
+        return bool(req.include_reasoning)
+    return INCLUDE_REASONING
 
 
 # data: URIs are megabytes; only inline them when explicitly allowed.

@@ -21,6 +21,17 @@ class ImageResponse:
     metadata: Dict[str, Any]
 
 
+@dataclass
+class ReasoningChunk:
+    """A piece of Copilot's visible thinking summary (deep / Reasoning mode).
+
+    Copilot streams these as ``Progress`` messages with ``contentOrigin``
+    ``ChainOfThoughtSummary`` before the answer. Not a ``str``, so consumers
+    that only handle text/images skip it unchanged.
+    """
+    text: str
+
+
 class AbstractProvider(ABC):
     label: str
     url: str

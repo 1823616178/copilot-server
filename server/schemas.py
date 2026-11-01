@@ -22,6 +22,18 @@ class ChatCompletionRequest(BaseModel):
     # to continue that thread; omit it to start a fresh conversation. Outside
     # OpenAI's schema, but standard clients can set it via extra_body.
     conversation_id: Optional[str] = None
+    # Thinking control (see server/reasoning.py). OpenAI style:
+    #   "reasoning_effort": "none"|"minimal"|"low"|"medium"|"high"
+    #   "reasoning": {"effort": ...}   (Responses-API style)
+    # Anthropic / DeepSeek style:  "thinking": {"type": "enabled"|"disabled"|"auto"}
+    # Direct:  "copilot_mode": "auto"|"quick"|"deep"
+    reasoning_effort: Optional[str] = None
+    reasoning: Optional[Any] = None
+    thinking: Optional[Any] = None
+    copilot_mode: Optional[str] = None
+    # Return the thinking summary as reasoning_content (default: env
+    # COPILOT_INCLUDE_REASONING, on).
+    include_reasoning: Optional[bool] = None
     # Any other OpenAI fields (temperature, max_tokens, ...) are accepted and
     # ignored — Copilot's consumer protocol doesn't expose those knobs.
 

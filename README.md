@@ -241,6 +241,35 @@ curl http://localhost:8000/v1/chat/completions \
 
 ---
 
+## Thinking mode (reasoning effort)
+
+Copilot's model picker has three modes; the bridge maps OpenAI-style knobs onto them.
+They differ only in the chat frame's `tone` field (captured from copilot.com):
+
+| mode    | Copilot UI          | `tone`      | ways to select |
+|---------|---------------------|-------------|----------------|
+| `quick` | 快速响应 / Quick     | `Chat`      | `reasoning_effort: none\|minimal`, `thinking: {"type":"disabled"}`, model `copilot-quick` / `copilot-fast` |
+| `auto`  | 自动 / Auto          | `Magic`     | `reasoning_effort: low\|medium`, `thinking: {"type":"auto"}`, model `copilot-auto` (default) |
+| `deep`  | 深度思考 / Think deeper | `Reasoning` | `reasoning_effort: high`, `thinking: {"type":"enabled"}`, model `copilot-think` / `copilot-deep` |
+
+Also accepted: `reasoning: {"effort": ...}` and `copilot_mode: auto|quick|deep`.
+Precedence: `copilot_mode` > `thinking` > `reasoning_effort` > model alias > `COPILOT_DEFAULT_MODE` (env, default `auto`).
+Unknown model names keep the default, so existing clients are unaffected. There are only three
+levels upstream — no token budget (`thinking.budget_tokens` is ignored).
+
+In `deep` mode Copilot streams a short thinking *summary* (not the raw chain of thought). It is returned
+DeepSeek-style as `choices[0].message.reasoning_content` (non-stream) or `delta.reasoning_content`
+chunks (stream). Disable with `"include_reasoning": false` or `COPILOT_INCLUDE_REASONING=0`.
+Responses also carry `"copilot_mode"` showing the mode used.
+
+```bash
+# no thinking
+curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model":"copilot","reasoning_effort":"none","messages":[{"role":"user","content":"hi"}]}'
+# think deeper, streamed with reasoning_content
+curl -N http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model":"copilot-think","stream":true,"messages":[{"role":"user","content":"Find all n with n^2+2^n a square"}]}'
+```
 ## Command line
 
 ```bash

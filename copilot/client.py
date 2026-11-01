@@ -29,7 +29,7 @@ from typing import Generator, List, Optional, Union
 
 from .auth import AUTH_MAX_AGE, load_auth
 from .driver import AuthExpired, Copilot
-from .models import Conversation, ImageResponse
+from .models import Conversation, ImageResponse, ReasoningChunk
 
 
 def _status(msg: str) -> None:
@@ -48,6 +48,8 @@ class ChatReply:
     text: str
     conversation_id: Optional[str]
     images: List[ImageResponse] = field(default_factory=list)
+    # Copilot's thinking summary (deep mode only; "" otherwise).
+    reasoning: str = ""
 
 
 class ChatStream:
@@ -171,12 +173,15 @@ class CopilotClient:
         s = self.stream(prompt, conversation_id=conversation_id, **kwargs)
         text: List[str] = []
         images: List[ImageResponse] = []
+        reasoning: List[str] = []
         for item in s:
             if isinstance(item, str):
                 text.append(item)
             elif isinstance(item, ImageResponse):
                 images.append(item)
-        return ChatReply("".join(text), s.conversation_id, images)
+            elif isinstance(item, ReasoningChunk):
+                reasoning.append(item.text)
+        return ChatReply("".join(text), s.conversation_id, images, "".join(reasoning))
 
     def _fresh_auth(self, force: bool = False) -> dict:
         """Return current signed-in auth, refreshing it when stale or forced."""

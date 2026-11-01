@@ -5,6 +5,16 @@ import os
 # The single model id this bridge advertises (Copilot has no model selector).
 MODEL_NAME = "copilot"
 
+# Default thinking mode when a request doesn't choose one: auto | quick | deep.
+#   auto  = Copilot "自动" (tone Magic), quick = "快速响应" (tone Chat),
+#   deep  = "深度思考" (tone Reasoning). Read per request in server/reasoning.py.
+DEFAULT_MODE = os.environ.get("COPILOT_DEFAULT_MODE", "auto")
+
+# Emit Copilot's thinking summary as ``reasoning_content`` (DeepSeek-style;
+# message field when not streaming, delta field when streaming). Per request:
+# "include_reasoning": true/false.
+INCLUDE_REASONING = os.environ.get("COPILOT_INCLUDE_REASONING", "1").strip().lower() not in ("0", "false", "no", "off")
+
 # Self-imposed rate limit (Copilot publishes none). Tune to whatever ceiling the
 # probe in tests/ratelimit.py shows your account tolerates.
 #   RATE_LIMIT_RPM   requests/minute the bridge will accept; 0 disables limiting.

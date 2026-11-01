@@ -113,6 +113,7 @@ class Copilot(AbstractProvider):
         if image is not None:
             images.insert(0, image)
         anchor = kwargs.pop("anchor", None)
+        tone = kwargs.pop("tone", None) or "Magic"
         if conversation is not None:
             conversation_id = conversation.conversation_id
             access_token = access_token or conversation.access_token
@@ -158,7 +159,7 @@ class Copilot(AbstractProvider):
             wss.send(HANDSHAKE, CurlWsFlag.TEXT)
             wss.send(PING, CurlWsFlag.TEXT)
             wss.send(encode(chat_frame(prompt, request_id, session_id, start_of_session,
-                                        annotations or None)),
+                                        annotations or None, tone=tone)),
                      CurlWsFlag.TEXT)
             yield from self._read_stream(wss, timeout)
 

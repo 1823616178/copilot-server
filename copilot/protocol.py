@@ -197,8 +197,18 @@ def image_annotation(doc_id: str, file_name: str, file_type: str) -> dict:
     }
 
 
+# Response mode ("thinking") selector. Captured from copilot.com's model picker
+# (session/mode_capture.json): the three choices differ *only* in the chat
+# frame's ``tone`` field — nothing else in the frame or socket URL changes.
+#   自动 / Auto          -> "Magic"      (model decides how long to think)
+#   快速响应 / Quick     -> "Chat"       (answer immediately, no reasoning)
+#   深度思考 / Think deeper -> "Reasoning" (long reasoning pass)
+TONE_AUTO, TONE_QUICK, TONE_DEEP = "Magic", "Chat", "Reasoning"
+TONES = (TONE_AUTO, TONE_QUICK, TONE_DEEP)
+
+
 def chat_frame(text: str, request_id: str, session_id: str, start_of_session: bool,
-               annotations: Optional[list] = None) -> dict:
+               annotations: Optional[list] = None, tone: str = TONE_AUTO) -> dict:
     """The ``chat`` invocation the web client sends for one user message."""
     client_info = _client_info(session_id)
     frame = {
@@ -234,7 +244,7 @@ def chat_frame(text: str, request_id: str, session_id: str, start_of_session: bo
             },
             "plugins": [{"Id": "BingWebSearch", "Source": "BuiltIn"}],
             "isSbsSupported": True,
-            "tone": "Magic",
+            "tone": tone if tone in TONES else TONE_AUTO,
             "renderReferencesBehindEOS": True,
             "disconnectBehavior": "continue",
         }],
@@ -337,6 +347,9 @@ class TurnParser:
         self.images: list = []
         self._image_urls: set = set()
         self._data_images: list = []  # data: URI fallbacks, used only if no https URL
+        # Thinking summary (ChainOfThoughtSummary progress messages), by message id.
+        self.reasoning = ""
+        self._cot: dict = {}
 
     def feed(self, record: dict) -> List[str]:
         kind = record.get("type")
@@ -379,8 +392,30 @@ class TurnParser:
             if isinstance(message, dict):
                 if _is_reply(message):
                     chunks.extend(self._sync(message["text"]))
+                chunks.extend(self._collect_reasoning(message))
                 chunks.extend(self._collect_images(message))
         return chunks
+
+    def _collect_reasoning(self, message: dict) -> list:
+        """New thinking-summary text as ReasoningChunk (only what wasn't sent yet)."""
+        if (message.get("author") != "bot" or message.get("contentOrigin") != "ChainOfThoughtSummary"
+                or not isinstance(message.get("text"), str)):
+            return []
+        from .models import ReasoningChunk
+
+        key = message.get("messageId") or message.get("requestId") or len(self._cot)
+        text, seen = message["text"], self._cot.get(key)
+        if seen is None:
+            piece = ("\n\n" if self.reasoning else "") + text
+        elif text.startswith(seen):
+            piece = text[len(seen):]
+        else:
+            return []  # rewrite of an already-sent step: keep output append-only
+        self._cot[key] = text
+        if not piece:
+            return []
+        self.reasoning += piece
+        return [ReasoningChunk(piece)]
 
     def _collect_images(self, message: dict) -> list:
         """New https images as ImageResponse; stash data: URIs as fallback."""
